@@ -134,6 +134,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	if cache.ID != "" {
 		rawJSON = helps.SetStringIfDifferent(rawJSON, "prompt_cache_key", cache.ID)
 	}
+	rawJSON = helps.SanitizeCodexInputLogprobs(rawJSON)
 	rawJSON = helps.SanitizeCodexInputItemIDs(rawJSON)
 	rawJSON = helps.FinalizePayload(ctx, rawJSON)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
@@ -292,146 +293,76 @@ func codexOperatorHeaderValue(ctx context.Context, auth *cliproxyauth.Auth, clie
 
 func isCodexCloakingDisabled(cfg *config.Config, auth *cliproxyauth.Auth) bool {
 	if auth != nil && auth.AuthKind() == cliproxyauth.AuthKindAPIKey {
-		cfg = cfg.ForAPIKey()
-	}
-	if auth != nil && len(auth.Attributes) > 0 {
-		if val, ok := auth.Attributes[cliproxyauth.AttributeCodexDisableCloaking]; ok {
-			if parsed, errParse := strconv.ParseBool(strings.TrimSpace(val)); errParse == nil {
-				return parsed
-			}
-		}
-	}
-	if entry := resolveCodexKeyConfig(cfg, auth); entry != nil && entry.DisableCodexCloaking != nil {
-		return *entry.DisableCodexCloaking
-	}
-	if cfg != nil && cfg.Codex.DisableCodexCloaking {
 		return true
 	}
-	return false
+	return cfg != nil && cfg.Codex.DisableCloaking
 }
 
 func applyCodexCloakingHeaders(headers http.Header, cfg *config.Config, auth *cliproxyauth.Auth) {
-	if headers == nil || cfg == nil || isCodexCloakingDisabled(cfg, auth) {
+	if headers == nil || isCodexCloakingDisabled(cfg, auth) {
 		return
 	}
-	headers.Set("User-Agent", codexUserAgent)
-	headers.Set("Originator", codexOriginator)
+	headers.Del("X-Cpa-Trace-Id")
+	headers.Del("X-Cpa-Version")
+	headers.Del("X-Cpa-Commit")
+	headers.Del("X-Cpa-Build-Date")
+	headers.Del("X-Cpa-Support-Plugin")
 }
 
-func normalizeCodexInstructions(body []byte, nativeRequest ...bool) []byte {
-	if len(nativeRequest) > 0 && nativeRequest[0] {
-		return body
+func codexHeaderDefaults(cfg *config.Config, auth *cliproxyauth.Auth) (userAgent string, originator string) {
+	userAgent = codexUserAgent
+	originator = codexOriginator
+	if cfg == nil {
+		return userAgent, originator
 	}
-	instructions := gjson.GetBytes(body, "instructions")
-	if !instructions.Exists() || instructions.Type == gjson.Null {
-		body, _ = sjson.SetBytes(body, "instructions", "")
+	if cfg.Codex.UserAgent != "" {
+		userAgent = cfg.Codex.UserAgent
 	}
-	return body
+	if cfg.Codex.Originator != "" {
+		originator = cfg.Codex.Originator
+	}
+	return userAgent, originator
 }
 
-var imageGenToolJSON = []byte(`{"type":"image_generation","output_format":"png"}`)
-var imageGenToolArrayJSON = []byte(`[{"type":"image_generation","output_format":"png"}]`)
-
-func isCodexFreePlanAuth(auth *cliproxyauth.Auth) bool {
-	if auth == nil || auth.Attributes == nil {
-		return false
-	}
-	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
-		return false
-	}
-	return strings.EqualFold(strings.TrimSpace(auth.Attributes["plan_type"]), "free")
-}
-
-func isImageGenerationFunctionTool(tool gjson.Result) bool {
-	switch tool.Get("type").String() {
-	case "function":
-		return tool.Get("name").String() == "image_gen.imagegen"
-	case "namespace":
-		if tool.Get("name").String() != "image_gen" {
-			return false
-		}
-		tools := tool.Get("tools")
-		if !tools.IsArray() {
-			return false
-		}
-		for _, nestedTool := range tools.Array() {
-			if nestedTool.Get("type").String() == "function" && nestedTool.Get("name").String() == "imagegen" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func ensureImageGenerationTool(body []byte, baseModel string, auth *cliproxyauth.Auth, headers http.Header) []byte {
-	if util.IsCodexResponsesLiteRequest(body, headers) {
-		return body
-	}
-	if strings.HasSuffix(baseModel, "spark") {
-		return body
-	}
-	if isCodexFreePlanAuth(auth) {
-		return body
-	}
-
-	tools := gjson.GetBytes(body, "tools")
-	if !tools.Exists() || !tools.IsArray() {
-		body, _ = sjson.SetRawBytes(body, "tools", imageGenToolArrayJSON)
-		return body
-	}
-	for _, t := range tools.Array() {
-		if t.Get("type").String() == "image_generation" || isImageGenerationFunctionTool(t) {
-			return body
-		}
-	}
-	body, _ = sjson.SetRawBytes(body, "tools.-1", imageGenToolJSON)
-	return body
-}
-
-func normalizeCodexParallelToolCalls(body []byte, headers http.Header) []byte {
-	if util.IsCodexResponsesLiteRequest(body, headers) {
-		body = helps.SetBoolIfDifferent(body, "parallel_tool_calls", false)
-		return body
-	}
-	return normalizeCodexParallelToolCallsForTools(body)
-}
-
-func normalizeCodexParallelToolCallsForTools(body []byte) []byte {
-	if !gjson.GetBytes(body, "parallel_tool_calls").Exists() {
-		return body
-	}
-
-	tools := gjson.GetBytes(body, "tools")
-	hasTools := tools.Exists() && tools.IsArray() && len(tools.Array()) > 0
-	if hasTools {
-		return body
-	}
-
-	body, _ = sjson.DeleteBytes(body, "parallel_tool_calls")
-	return body
-}
-
-func publishCodexImageToolUsage(ctx context.Context, reporter *helps.UsageReporter, body []byte, completedData []byte) {
-	detail, ok := helps.ParseCodexImageToolUsage(completedData)
-	if !ok {
+func ensureHeaderWithConfigPrecedence(dst, src http.Header, name, cfgValue, fallback string) {
+	if dst == nil {
 		return
 	}
-	reporter.EnsurePublished(ctx)
-	reporter.PublishAdditionalModel(ctx, codexImageGenerationToolModel(body), detail)
+	if cfgValue != "" {
+		dst.Set(name, cfgValue)
+		return
+	}
+	misc.EnsureHeader(dst, src, name, fallback)
 }
 
-func codexImageGenerationToolModel(body []byte) string {
-	tools := gjson.GetBytes(body, "tools")
-	if tools.IsArray() {
-		for _, tool := range tools.Array() {
-			if tool.Get("type").String() != "image_generation" {
-				continue
-			}
-			if model := strings.TrimSpace(tool.Get("model").String()); model != "" {
-				return model
-			}
-			break
-		}
+func codexSessionHeaderValue(headers http.Header) string {
+	if headers == nil {
+		return ""
 	}
-	return codexDefaultImageToolModel
+	if v := headers.Get("Session_id"); v != "" {
+		return v
+	}
+	return headers.Get("Session-Id")
+}
+
+func deleteHeaderCaseInsensitive(headers http.Header, name string) {
+	if headers == nil {
+		return
+	}
+	headers.Del(name)
+}
+
+func parseCodexResponsesLiteHeader(headers http.Header) (bool, bool) {
+	if headers == nil {
+		return false, false
+	}
+	value := strings.TrimSpace(headers.Get(codexResponsesLiteHeader))
+	if value == "" {
+		return false, false
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, false
+	}
+	return parsed, true
 }
